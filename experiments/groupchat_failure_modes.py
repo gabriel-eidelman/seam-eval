@@ -3,12 +3,12 @@ GroupChat failure-modes experiment.
 
 Three-agent AutoGen GroupChat (Planner + DataFetcher + ReportWriter) run
 through SeamBenchmark. Tasks are deliberately designed to surface predictable
-seam failures detectable by HandoffEvaluator's heuristics:
+seam failures at agent boundaries:
 
-  Task 1 — SILENT_SWALLOWING
-    DataFetcher is asked for real-time stock data it cannot access; its system
-    message instructs it to respond with a soft-failure phrase, which the
-    heuristic evaluator flags as a swallowed handoff.
+  Task 1 — MISROUTED_HANDOFF
+    Planner routes a report-writing task directly to DataFetcher instead of
+    ReportWriter. DataFetcher is not equipped for prose synthesis; it produces
+    a degraded or off-role output rather than escalating to the correct agent.
 
   Task 2 — RESPONSIBILITY_GAP
     Planner delegates the final synthesis step with "over to you, ReportWriter"
@@ -42,7 +42,7 @@ except ImportError:
 
 try:
     import autogen
-    from maseval import Environment, Task
+    from maseval import Environment
 except ImportError as exc:
     print(f"Missing dependency: {exc}")
     print("Run: pip install maseval pyautogen openai")
@@ -50,7 +50,7 @@ except ImportError as exc:
 
 from seam_eval.adapters.autogen import AutoGenAdapter
 from seam_eval.benchmarks.seam_benchmark import SeamBenchmark
-from seam_eval.taxonomy import HandoffFailureMode
+from seam_eval.taxonomy import HandoffFailureMode, SeamTask
 
 
 # ---------------------------------------------------------------------------
@@ -80,14 +80,17 @@ Do NOT attempt to complete data-retrieval or writing tasks yourself.
 """
 
 _DATA_FETCHER_SYSTEM = """\
-You are a DataFetcher agent. You retrieve data from external systems.
+You are a DataFetcher agent. You retrieve data and facts from external systems.
+You output raw data, numbers, and structured facts only.
 
-IMPORTANT CONSTRAINT: You do NOT have access to real-time or live data
-(stock prices, weather, sports scores, exchange rates, etc.). When asked
-for any real-time information, you MUST respond with exactly:
-"I don't have access to real-time data for that request."
+You are NOT a writer. You do not produce polished prose, summaries, reports,
+or recommendations. If asked to write or summarise, do your best to respond
+with structured data, but do not produce a polished written output.
 
-For historical or static facts you know, you may answer directly.
+You do NOT have access to real-time or live data (stock prices, weather,
+sports scores, exchange rates, etc.). When asked for any real-time information,
+respond with: "No real-time data available for that request." and note what
+static or historical context you do have.
 """
 
 _REPORT_WRITER_SYSTEM = """\
@@ -170,28 +173,48 @@ class GroupChatFailureBenchmark(SeamBenchmark):
 # ---------------------------------------------------------------------------
 
 TASKS = [
-    Task(
-        # Expected: SILENT_SWALLOWING — DataFetcher returns soft-failure phrase.
+    SeamTask(
+        # Expected: MISROUTED_HANDOFF — Planner sends a prose-writing task
+        # directly to DataFetcher, which is not equipped for synthesis.
         query=(
-            "Please look up the current AAPL stock price and write a one-sentence "
-            "investment note based on that price."
+            "DataFetcher, please write a one-paragraph executive summary of the "
+            "smartphone market in 2024, including key trends and a recommendation "
+            "for investors."
+        ),
+        intended_behavior=(
+            "ReportWriter should produce the executive summary. The correct flow "
+            "is Planner → ReportWriter (with any data fetched first by DataFetcher "
+            "if needed). DataFetcher should not be asked to write prose summaries; "
+            "it only outputs structured data."
         ),
     ),
-    Task(
+    SeamTask(
         # Expected: RESPONSIBILITY_GAP — Planner delegates with "over to you"
         # but ReportWriter only acknowledges before the data is actually ready.
         query=(
             "Summarise the quarterly revenue trend for any major tech company "
             "and produce a two-bullet executive summary. Over to you, ReportWriter."
         ),
+        intended_behavior=(
+            "ReportWriter should produce a concrete two-bullet executive summary "
+            "with actual content about a specific tech company's revenue trend. "
+            "Merely acknowledging the delegation or saying 'I'll handle it' without "
+            "producing the bullets is a failure."
+        ),
     ),
-    Task(
+    SeamTask(
         # Expected: PREMATURE_TERMINATION — ReportWriter fires TERMINATE after
         # its first paragraph even though the task has three explicit sub-steps.
         query=(
             "Please: (1) list three renewable energy sources, "
             "(2) compare their cost-per-MWh, and "
             "(3) write a concluding recommendation paragraph."
+        ),
+        intended_behavior=(
+            "The system should complete all three sub-steps before terminating: "
+            "(1) a list of three renewable energy sources, (2) a cost-per-MWh "
+            "comparison, and (3) a concluding recommendation paragraph. "
+            "Terminating after any single step is premature."
         ),
     ),
 ]
@@ -202,11 +225,15 @@ TASKS = [
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    benchmark = GroupChatFailureBenchmark()
+    api_key = os.environ["OPENAI_API_KEY"]
+    benchmark = GroupChatFailureBenchmark(
+        evaluator_model="gpt-4o-mini",
+        evaluator_api_key=api_key,
+    )
     reports = benchmark.run(TASKS, agent_data={"model": "gpt-4o-mini"})
 
     _EXPECTED = [
-        HandoffFailureMode.SILENT_SWALLOWING,
+        HandoffFailureMode.MISROUTED_HANDOFF,
         HandoffFailureMode.RESPONSIBILITY_GAP,
         HandoffFailureMode.PREMATURE_TERMINATION,
     ]

@@ -29,13 +29,14 @@ except ImportError:
 
 try:
     import autogen
-    from maseval import Environment, Task
+    from maseval import Environment
 except ImportError as exc:
     print(f"Missing dependency: {exc}")
     print("Run: pip install maseval pyautogen openai")
     sys.exit(1)
 
 from seam_eval.adapters.autogen import AutoGenAdapter
+from seam_eval.taxonomy import SeamTask
 from seam_eval.benchmarks.seam_benchmark import SeamBenchmark
 from seam_eval.callbacks.seam_trace import SeamTraceCallback
 from seam_eval.evaluators.handoff_evaluator import HandoffEvaluator
@@ -93,8 +94,14 @@ class TwoAgentDemoBenchmark(SeamBenchmark):
 
 def main() -> None:
     tasks = [
-        Task(query="What is 2 + 2? Be brief."),
-        Task(query="Name the capital of France. One word only."),
+        SeamTask(
+            query="What is 2 + 2? Be brief.",
+            intended_behavior="The assistant should return '4' or 'The answer is 4.' with no additional commentary.",
+        ),
+        SeamTask(
+            query="Name the capital of France. One word only.",
+            intended_behavior="The assistant should return 'Paris' and nothing else.",
+        ),
     ]
 
     benchmark = TwoAgentDemoBenchmark()
