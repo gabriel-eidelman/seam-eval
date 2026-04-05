@@ -20,20 +20,46 @@ A production-quality `AgentAdapter` (`seam_eval/adapters/autogen.py`) integratin
 
 ### 2. Handoff failure taxonomy
 
-A structured classification of multi-agent failure modes at the transition level, defined in `seam_eval/taxonomy.py` as `HandoffFailureMode`:
+A structured classification of multi-agent failure modes at the transition level, defined in `seam_eval/taxonomy.py`. Modes are organized into five `FailureCategory` families:
+
+**Routing failures** — task sent to the wrong place or owned by no one
 
 | Mode | Description |
 |---|---|
-| `context_truncation` | Agent B receives an impoverished representation of what agent A reasoned |
-| `misrouted_handoff` | Task is sent to the wrong specialist; receiving agent attempts it anyway |
-| `silent_swallowing` | Agent receives a task it cannot handle, returns a soft failure, system continues |
-| `responsibility_gap` | Two agents each assume the other owns a subtask; neither executes it |
-| `compounding_drift` | Small framing errors accumulate across a chain; terminal task diverges from original |
-| `premature_termination` | Handoff/stop condition triggers on intermediate output, cutting off incomplete work |
+| `misrouted_handoff` | Task dispatched to a specialist not equipped for it; that agent attempts execution anyway and produces a wrong or degraded result |
+| `responsibility_gap` | Two or more agents each assume a subtask belongs to the other; no agent executes it and the gap is not surfaced |
+
+**Loop failures** — control flow never terminates
+
+| Mode | Description |
+|---|---|
+| `agent_self_loop` | A single agent re-invokes itself without making progress; the loop continues until a turn or token budget is exhausted |
+| `mutual_loop` | Two agents hand off to each other indefinitely; neither reaches a terminal condition or escalates the deadlock |
+
+**Context failures** — information state at the seam is wrong
+
+| Mode | Description |
+|---|---|
+| `context_insufficiency` | The receiving agent lacks sufficient context; it does not explicitly fail but silently produces an incorrect or partial output |
+| `context_corruption` | The receiving agent is passed stale, conflicting, or structurally malformed context that causes downstream processing errors |
+
+**Termination failures** — the chain stops at the wrong moment
+
+| Mode | Description |
+|---|---|
+| `premature_termination` | A stop condition fires on an intermediate output, halting work before the task is complete |
+| `missed_termination` | No agent triggers a stop condition after task completion; the chain continues executing, consuming resources or producing spurious output |
+
+**Output failures** — the result is structurally wrong
+
+| Mode | Description |
+|---|---|
+| `compounding_drift` | Small framing errors accumulate across a multi-hop chain; the terminal output diverges from the original goal despite no single catastrophic failure |
+| `duplicate_execution` | Two or more agents each complete the same subtask independently; their results conflict and no reconciliation strategy exists |
 
 ### 3. SeamTrace
 
-A `Callback`-based instrumentation layer (`seam_eval/callbacks/seam_trace.py`) that attaches structured metadata to every agent transition, recording context passed, context dropped, the receiving agent, its return value, and the resulting failure classification. Produces per-task `SeamTrace` objects that serve as the primary unit of analysis.
+A `Callback`-based instrumentation layer (`seam_eval/callbacks/seam_trace.py`) that attaches structured metadata to every agent transition, recording context passed, context dropped, the receiving agent, its return value, and the resulting failure classification. Produces per-task `SeamTrace` objects — grouped by `FailureCategory` — that serve as the primary unit of analysis.
 
 ---
 
@@ -56,7 +82,7 @@ SeamEval (this repo)
 │   ├── callbacks/
 │   │   └── seam_trace.py            # handoff instrumentation callback
 │   ├── evaluators/
-│   │   └── handoff_evaluator.py     # heuristic failure classifier
+│   │   └── handoff_evaluator.py     # LLM-based failure classifier
 │   └── benchmarks/
 │       └── seam_benchmark.py        # base benchmark wiring it all together
 └── experiments/
@@ -65,9 +91,13 @@ SeamEval (this repo)
 
 ### `taxonomy.py` — the data model
 
-The entire framework is grounded in three types:
+The entire framework is grounded in five types:
 
-**`HandoffFailureMode`** — an enum of the six failure modes plus `NONE` for successful transitions. All classification and reporting is keyed on this enum. New failure modes should be added here before any detection logic is written.
+**`SeamTask`** — a MASEval `Task` subclass that carries an `intended_behavior` field: one to three sentences describing what a correct run looks like (expected answer, expected agent process, or both). This is injected into the `HandoffEvaluator` prompt so the LLM can distinguish genuine failures from correct agent behavior (e.g. an agent correctly reporting it lacks live-data access is not a failure).
+
+**`FailureCategory`** — an enum of the five failure families (`ROUTING`, `LOOP`, `CONTEXT`, `TERMINATION`, `OUTPUT`). Used for grouping in reports and filtering.
+
+**`HandoffFailureMode`** — an enum of ten failure modes plus `NONE` for successful transitions. All classification and reporting is keyed on this enum. New failure modes should be added here before any detection logic is written. The `FAILURE_CATEGORIES` dict maps each mode to its `FailureCategory`.
 
 **`SeamEvent`** — a dataclass representing a single agent transition. Captures:
 - `sender` and `receiver` (agent names)
@@ -77,8 +107,9 @@ The entire framework is grounded in three types:
 - `receiver_response` (the receiver's return value)
 - `failure_mode` and `failure_rationale` (filled in post-hoc by `HandoffEvaluator`)
 - `turn_index` and `metadata`
+- `.category` property — returns the `FailureCategory` for the assigned failure mode
 
-**`SeamTrace`** — an ordered list of `SeamEvent` objects for a single task run, plus convenience methods: `failures`, `failure_rate`, `failure_counts()`, and `report()`. Produced by `SeamTraceCallback`; consumed by `HandoffEvaluator`.
+**`SeamTrace`** — an ordered list of `SeamEvent` objects for a single task run, plus convenience methods: `failures`, `failure_rate`, `failure_counts()`, `failures_by_category()`, and `report()` (which groups output by category). Produced by `SeamTraceCallback`; consumed by `HandoffEvaluator`.
 
 ### `adapters/autogen.py` — `AutoGenAdapter`
 
@@ -104,18 +135,17 @@ The `on_handoff` hook computes `context_dropped` as the set difference between `
 
 ### `evaluators/handoff_evaluator.py` — `HandoffEvaluator`
 
-A MASEval `Evaluator` that classifies failure modes in a `SeamTrace`. Iterates over every `SeamEvent` and applies a **deterministic rule cascade**, ordered by specificity (most specific checks first):
+A MASEval `Evaluator` that classifies failure modes in a `SeamTrace` using **LLM-based evaluation**. It formats the full `SeamEvent` transcript into a structured prompt — including the `intended_behavior` description from `SeamTask` — and submits it to an OpenAI-compatible model, which returns per-event failure classifications as structured JSON.
 
-1. **Misrouted handoff** — receiver name differs from `expected_receiver` (requires caller to supply ground truth)
-2. **Context truncation** — `context_dropped / context_available ≥ 0.5`
-3. **Silent swallowing** — empty response, or response contains soft-failure phrases (`"i cannot"`, `"i don't have access"`, `"as an ai"`, etc.)
-4. **Premature termination** — response contains a termination signal (`"terminate"`, `"task complete"`, etc.) while the message still contains open-task markers (`?`, `"please"`, `"find"`, etc.)
-5. **Responsibility gap** — message contains delegation language (`"over to you"`, `"please handle"`) but response is a short acknowledgement only (`"understood"`, `"noted"`, etc.)
-6. **Compounding drift** — intentionally stubbed; requires cross-event analysis at the benchmark level
+The `intended_behavior` field is critical: it lets the LLM distinguish genuine structural failures from correct agent behavior (e.g. an agent correctly refusing an out-of-scope task should be classified as `none`, not `misrouted_handoff`).
 
-The cascade short-circuits on the first match. To extend with LLM-based classification, subclass `HandoffEvaluator` and override `_classify_event`.
+Key design points:
+- Uses `response_format={"type": "json_object"}` and `temperature=0` for deterministic output.
+- LLM output is mapped back onto `SeamEvent.failure_mode` and `SeamEvent.failure_rationale`. Rationale is prefixed with the LLM's `confidence` level (`high`/`medium`/`low`).
+- Unknown failure mode labels from the LLM default to `NONE` with a warning logged.
+- The default model is `gpt-4o-mini`; any OpenAI-compatible endpoint can be used via `base_url`.
 
-`evaluate()` returns a structured report dict:
+`evaluate()` accepts an `intended_behavior` string and returns a structured report dict:
 
 ```python
 {
@@ -123,14 +153,15 @@ The cascade short-circuits on the first match. To extend with LLM-based classifi
     "total_transitions": int,
     "failure_count": int,
     "failure_rate": float,
-    "failure_counts": {"context_truncation": 2, ...},  # non-zero modes only
+    "failure_counts": {"context_insufficiency": 2, ...},  # non-zero modes only
+    "overall_summary": str,                                # LLM-generated summary
     "events": [
         {
             "turn_index": int,
             "sender": str,
             "receiver": str,
             "failure_mode": str,
-            "failure_rationale": str | None,
+            "failure_rationale": str | None,               # includes confidence prefix
             "description": str,
         },
         ...
@@ -247,29 +278,37 @@ for trace in benchmark.seam_traces.values():
     print(trace.report())
 ```
 
-### Injecting LLM-based classification
+### Using `SeamTask` and `intended_behavior`
+
+Pass `intended_behavior` on each task so the LLM evaluator can correctly distinguish failures from correct agent behavior:
+
+```python
+from seam_eval.taxonomy import SeamTask
+
+tasks = [
+    SeamTask(
+        query="Find the current price of AAPL and summarise analyst sentiment.",
+        intended_behavior=(
+            "The retrieval agent should fetch live stock data and pass it to "
+            "the summariser. The final answer should include a price and a "
+            "sentiment label. An agent reporting it lacks live-data access is "
+            "a failure only if the data was actually available."
+        ),
+    )
+]
+benchmark = MyBenchmark(agent_data={"api_key": "sk-..."})
+reports = benchmark.run(tasks)
+```
+
+### Using a custom or alternative model
 
 ```python
 from seam_eval.evaluators.handoff_evaluator import HandoffEvaluator
-from seam_eval.taxonomy import HandoffFailureMode, SeamEvent
 
-
-class LLMHandoffEvaluator(HandoffEvaluator):
-    def _classify_event(self, event, expected_receiver=None):
-        # Run heuristics first; only call LLM if inconclusive.
-        mode, rationale = super()._classify_event(event, expected_receiver=expected_receiver)
-        if mode is HandoffFailureMode.NONE and len(event.message) > 200:
-            mode, rationale = self._llm_classify(event)
-        return mode, rationale
-
-    def _llm_classify(self, event):
-        # Your LLM call here.
-        ...
-
-
+evaluator = HandoffEvaluator(model="gpt-4o", api_key="sk-...")
 benchmark = MyBenchmark(
     agent_data={"api_key": "sk-..."},
-    handoff_evaluator=LLMHandoffEvaluator(),
+    handoff_evaluator=evaluator,
 )
 ```
 
