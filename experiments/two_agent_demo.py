@@ -22,6 +22,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed; rely on env vars being set externally
+
+try:
     import autogen
     from maseval import Environment, Task
 except ImportError as exc:
