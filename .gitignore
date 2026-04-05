@@ -33,3 +33,6 @@ htmlcov/
 # Environment / secrets
 .env
 *.env
+
+# Logs
+chat_logs/
