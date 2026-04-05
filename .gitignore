@@ -36,3 +36,4 @@ htmlcov/
 
 # Logs
 chat_logs/
+.claude/

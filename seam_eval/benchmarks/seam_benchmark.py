@@ -42,10 +42,15 @@ class SeamBenchmark(Benchmark):
     def __init__(
         self,
         handoff_evaluator: Optional[HandoffEvaluator] = None,
+        evaluator_model: str = "gpt-4o-mini",
+        evaluator_api_key: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        self._handoff_evaluator = handoff_evaluator or HandoffEvaluator()
+        self._handoff_evaluator = handoff_evaluator or HandoffEvaluator(
+            model=evaluator_model,
+            api_key=evaluator_api_key,
+        )
         # Keyed by task_id; populated during run.
         self._seam_traces: dict[str, SeamTrace] = {}
 
@@ -90,6 +95,8 @@ class SeamBenchmark(Benchmark):
         """
         task_id = str(getattr(task, "id", id(task)))
         self._active_callback = SeamTraceCallback(task_id=task_id)
+        # Stash intended_behavior from SeamTask so evaluate() can use it.
+        self._intended_behavior: str | None = getattr(task, "intended_behavior", None) or None
         return []
 
     def _populate_seam_trace(self, traces: Any) -> None:
@@ -148,11 +155,9 @@ class SeamBenchmark(Benchmark):
             seam_trace = self._active_callback.trace
             self._seam_traces[seam_trace.task_id] = seam_trace
 
-            # expected_agents can be provided via task metadata if available.
-            expected_agents: list[str] | None = None
             handoff_report = self._handoff_evaluator.evaluate(
                 seam_trace,
-                expected_agents=expected_agents,
+                intended_behavior=getattr(self, "_intended_behavior", None),
             )
             results.append(
                 {
