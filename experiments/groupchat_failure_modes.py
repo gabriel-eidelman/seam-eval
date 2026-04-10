@@ -124,17 +124,17 @@ class GroupChatFailureBenchmark(SeamBenchmark):
             "config_list": [{"model": agent_data["model"], "api_key": api_key}]
         }
 
-        planner = autogen.AssistantAgent(
+        planner = autogen.ConversableAgent(
             name="Planner",
             llm_config=llm_config,
             system_message=_PLANNER_SYSTEM,
         )
-        data_fetcher = autogen.AssistantAgent(
+        data_fetcher = autogen.ConversableAgent(
             name="DataFetcher",
             llm_config=llm_config,
             system_message=_DATA_FETCHER_SYSTEM,
         )
-        report_writer = autogen.AssistantAgent(
+        report_writer = autogen.ConversableAgent(
             name="ReportWriter",
             llm_config=llm_config,
             system_message=_REPORT_WRITER_SYSTEM,
@@ -143,12 +143,13 @@ class GroupChatFailureBenchmark(SeamBenchmark):
         groupchat = autogen.GroupChat(
             agents=[planner, data_fetcher, report_writer],
             messages=[],
-            max_round=10,
+            max_round=6,
             speaker_selection_method="auto",
         )
         manager = autogen.GroupChatManager(
             groupchat=groupchat,
             llm_config=llm_config,
+            is_termination_msg=lambda m: "TERMINATE" in (m.get("content") or "")
         )
 
         # UserProxy initiates; GroupChatManager drives the round-robin.

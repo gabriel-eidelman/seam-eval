@@ -107,10 +107,16 @@ class AutoGenAdapter(AgentAdapter):
         """
         Return the full conversation history in MASEval's expected format.
 
-        AutoGen stores messages per-agent in agent.chat_messages. We merge
-        both sides of the conversation and sort by position to reconstruct
-        the interleaved history.
+        For GroupChat setups (responder is a GroupChatManager), we pull from
+        groupchat.messages which contains the complete interleaved history for
+        all participating agents. For plain two-agent setups we fall back to
+        agent.chat_messages.
         """
+        # GroupChatManager exposes the full internal message log via .groupchat
+        if hasattr(self._responder, "groupchat"):
+            messages = list(self._responder.groupchat.messages)
+            return MessageHistory([self._normalise_message(m) for m in messages])
+
         raw: dict[ConversableAgent, list[dict[str, Any]]] = (
             self.agent.chat_messages
         )
