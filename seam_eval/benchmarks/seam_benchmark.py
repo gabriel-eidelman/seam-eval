@@ -8,6 +8,8 @@ handoff-level failure attribution wired up automatically.
 from __future__ import annotations
 
 import logging
+import os
+from datetime import datetime
 from typing import Any, Optional
 
 from maseval import Benchmark, Task
@@ -17,6 +19,11 @@ from seam_eval.evaluators.handoff_evaluator import HandoffEvaluator
 from seam_eval.taxonomy import SeamTrace
 
 logger = logging.getLogger(__name__)
+
+_TRANSCRIPT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+    "chat_transcripts",
+)
 
 
 class SeamBenchmark(Benchmark):
@@ -95,9 +102,74 @@ class SeamBenchmark(Benchmark):
         """
         task_id = str(getattr(task, "id", id(task)))
         self._active_callback = SeamTraceCallback(task_id=task_id)
+        self._active_task = task
         # Stash intended_behavior from SeamTask so evaluate() can use it.
         self._intended_behavior: str | None = getattr(task, "intended_behavior", None) or None
         return []
+
+    def _save_transcript(self, task: Task, traces: Any) -> None:
+        """
+        Write the full agent conversation to a file in the chat_transcripts dir.
+
+        The file is named  <task_id>_<timestamp>.txt  and contains every
+        message from every agent, formatted for human review.
+        """
+        os.makedirs(_TRANSCRIPT_DIR, exist_ok=True)
+
+        task_id = str(getattr(task, "id", id(task)))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{task_id}_{timestamp}.txt"
+        path = os.path.join(_TRANSCRIPT_DIR, filename)
+
+        lines: list[str] = []
+        lines.append("=" * 72)
+        lines.append(f"TASK ID  : {task_id}")
+        lines.append(f"RECORDED : {datetime.now().isoformat(timespec='seconds')}")
+        query = getattr(task, "query", "")
+        if query:
+            lines.append(f"QUERY    : {query}")
+        intended = getattr(task, "intended_behavior", "")
+        if intended:
+            lines.append(f"INTENDED : {intended}")
+        lines.append("=" * 72)
+        lines.append("")
+
+        # Collect messages from all agents; deduplicate by (name, role, content).
+        agent_traces = (traces or {}).get("agents", {})
+        seen: set[tuple[str, str, str]] = set()
+        all_messages: list[dict[str, Any]] = []
+        for agent_data in agent_traces.values():
+            for msg in agent_data.get("messages", []):
+                key = (
+                    msg.get("name", ""),
+                    msg.get("role", ""),
+                    (msg.get("content") or "")[:200],
+                )
+                if key not in seen:
+                    seen.add(key)
+                    all_messages.append(msg)
+
+        if all_messages:
+            lines.append("--- CONVERSATION ---")
+            lines.append("")
+            for msg in all_messages:
+                name = msg.get("name") or msg.get("role", "unknown")
+                role = msg.get("role", "")
+                header = f"[{name}]" if not role or name == role else f"[{name} / {role}]"
+                content = (msg.get("content") or "").strip()
+                lines.append(header)
+                lines.append(content)
+                lines.append("")
+        else:
+            lines.append("(no messages recorded)")
+            lines.append("")
+
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines))
+            logger.info("SeamBenchmark: transcript saved to %s", path)
+        except OSError as exc:
+            logger.warning("SeamBenchmark: could not save transcript: %s", exc)
 
     def _populate_seam_trace(self, traces: Any) -> None:
         """
@@ -146,6 +218,10 @@ class SeamBenchmark(Benchmark):
         under the key "evaluator": "HandoffEvaluator".
         """
         results = super().evaluate(evaluators, agents, final_answer, traces) or []
+
+        # Save full conversation transcript for human review.
+        if hasattr(self, "_active_task"):
+            self._save_transcript(self._active_task, traces)
 
         # Populate the seam trace from the collected message histories.
         self._populate_seam_trace(traces)
